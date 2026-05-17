@@ -16,6 +16,7 @@ from codex_remote_ssh_kit.bridge import (
     LaunchAgentStatusResult,
     RemoteCodexProfile,
     RemoteCommandResult,
+    benchmark_remote_profile,
     bootstrap_remote_daemon,
     build_remote_install_command,
     build_remote_upgrade_command,
@@ -123,33 +124,39 @@ def check_profile(
 def doctor_profile(
     name: Annotated[str, typer.Argument(help="Profile name.")],
     timeout: Annotated[float, typer.Option("--timeout", help="SSH timeout in seconds.")] = 10.0,
+    repair: Annotated[bool, typer.Option("--repair", help="Repair common setup issues, then re-run diagnostics.")] = False,
+    alias: Annotated[str | None, typer.Option("--alias", help="SSH Host alias to use when repairing SSH config.")] = None,
+    ssh_config: Annotated[Path, typer.Option("--ssh-config", help="SSH config path to update during repair.")] = Path("~/.ssh/config"),
+    local_interval: Annotated[int, typer.Option("--local-interval", help="Seconds between local SSH prewarm checks during repair.")] = 60,
+    remote_interval: Annotated[int, typer.Option("--remote-interval", help="Seconds between remote daemon warmups during repair.")] = 300,
+    warm_session_count: Annotated[int, typer.Option("--warm-session-count", help="Recent session files to touch during repair.")] = 25,
     state: Annotated[Path | None, typer.Option("--state", help="Profile store path.")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
 ) -> None:
     profile = _profile(name, state)
-    facts = run_diagnostics(profile, timeout=timeout)
-    local_agent = check_local_prewarm_launch_agent(profile)
-    if facts.get("ok"):
-        remote_agent = check_remote_daemon_launch_agent(profile, timeout=timeout)
-        prewarm_result = prewarm_ssh_master(profile, timeout=min(timeout, 10.0))
-    else:
-        remote_agent = _skipped_remote_agent_status(profile)
-        prewarm_result = _skipped_command_result(profile)
-    issues = _doctor_issues(facts, local_agent, remote_agent, prewarm_result)
-    payload = {
-        "profile": profile.__dict__,
-        "diagnostics": facts,
-        "local_launch_agent": _launch_agent_status_payload(local_agent),
-        "remote_launch_agent": _launch_agent_status_payload(remote_agent),
-        "prewarm": _command_payload(prewarm_result),
-        "issues": issues,
-        "ok": not issues,
-    }
+    payload = _doctor_payload(profile, timeout=timeout)
+    repair_payload: dict | None = None
+    if repair and payload["issues"]:
+        repair_payload = _repair_profile(
+            profile,
+            issues=payload["issues"],
+            alias=alias,
+            ssh_config=ssh_config,
+            local_interval=local_interval,
+            remote_interval=remote_interval,
+            warm_session_count=warm_session_count,
+            timeout=timeout,
+            state=state,
+        )
+        profile = _profile(name, state)
+        payload = _doctor_payload(profile, timeout=timeout)
+    if repair_payload:
+        payload["repair"] = repair_payload
     if json_output:
         console.print_json(json.dumps(payload))
     else:
         _print_doctor(payload)
-    if issues:
+    if payload["issues"]:
         raise typer.Exit(1)
 
 
@@ -224,6 +231,30 @@ def prewarm(
         _print_command_result("SSH Master Prewarm", result, "green" if result.ok else "yellow")
     if not result.ok:
         raise typer.Exit(result.exit_code)
+
+
+@app.command("benchmark")
+def benchmark_profile(
+    name: Annotated[str, typer.Argument(help="Profile name.")],
+    samples: Annotated[int, typer.Option("--samples", min=1, help="Number of warm samples per benchmark.")] = 5,
+    timeout: Annotated[float, typer.Option("--timeout", help="Per-command timeout in seconds.")] = 10.0,
+    include_cold: Annotated[bool, typer.Option("--include-cold", help="Close the SSH master once to measure cold attach.")] = False,
+    state: Annotated[Path | None, typer.Option("--state", help="Profile store path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
+) -> None:
+    profile = _profile(name, state)
+    payload = benchmark_remote_profile(
+        profile,
+        samples=samples,
+        timeout=timeout,
+        include_cold=include_cold,
+    )
+    if json_output:
+        console.print_json(json.dumps(payload))
+    else:
+        _print_benchmark(payload)
+    if not payload["ok"]:
+        raise typer.Exit(1)
 
 
 @app.command("optimize-app")
@@ -384,6 +415,78 @@ def _error(message: str) -> None:
     console.print(f"[red]Error:[/red] {message}")
 
 
+def _doctor_payload(profile: RemoteCodexProfile, *, timeout: float) -> dict:
+    facts = run_diagnostics(profile, timeout=timeout)
+    local_agent = check_local_prewarm_launch_agent(profile)
+    if facts.get("ok"):
+        remote_agent = check_remote_daemon_launch_agent(profile, timeout=timeout)
+        prewarm_result = prewarm_ssh_master(profile, timeout=min(timeout, 10.0))
+    else:
+        remote_agent = _skipped_remote_agent_status(profile)
+        prewarm_result = _skipped_command_result(profile)
+    issues = _doctor_issues(facts, local_agent, remote_agent, prewarm_result)
+    return {
+        "profile": profile.__dict__,
+        "diagnostics": facts,
+        "local_launch_agent": _launch_agent_status_payload(local_agent),
+        "remote_launch_agent": _launch_agent_status_payload(remote_agent),
+        "prewarm": _command_payload(prewarm_result),
+        "issues": issues,
+        "ok": not issues,
+    }
+
+
+def _repair_profile(
+    profile: RemoteCodexProfile,
+    *,
+    issues: list[dict[str, str]],
+    alias: str | None,
+    ssh_config: Path,
+    local_interval: int,
+    remote_interval: int,
+    warm_session_count: int,
+    timeout: float,
+    state: Path | None,
+) -> dict:
+    issue_names = {issue["check"] for issue in issues}
+    repairs: dict[str, dict] = {}
+    if "ssh" not in issue_names:
+        if any(name in issue_names for name in ("codex", "app-server", "daemon", "remote-control")):
+            command = build_remote_install_command(profile)
+            result = subprocess.run(command, check=False, text=True, capture_output=True)
+            repairs["install_remote_codex"] = {
+                "ok": result.returncode == 0,
+                "exit_code": result.returncode,
+                "command": command,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip(),
+            }
+        if "daemon" in issue_names or "remote-control" in issue_names or "remote-launch-agent" in issue_names:
+            daemon_result = bootstrap_remote_daemon(profile, timeout=timeout)
+            repairs["bootstrap_daemon"] = _command_payload(daemon_result)
+            remote_agent_result = install_remote_daemon_launch_agent(
+                profile,
+                interval_seconds=remote_interval,
+                warm_session_count=warm_session_count,
+                timeout=timeout,
+            )
+            repairs["remote_launch_agent"] = _launch_agent_payload(remote_agent_result)
+    ssh_result = install_official_ssh_config(profile, alias=alias, path=ssh_config)
+    profile = _save_alias(profile, ssh_result.alias, state)
+    repairs["ssh_config"] = {
+        "alias": ssh_result.alias,
+        "path": str(ssh_result.path),
+        "changed": ssh_result.changed,
+    }
+    if "local-launch-agent" in issue_names or "ssh-master" in issue_names:
+        local_agent_result = install_local_prewarm_launch_agent(profile, interval_seconds=local_interval)
+        repairs["local_launch_agent"] = _launch_agent_payload(local_agent_result)
+    if "ssh" not in issue_names:
+        prewarm_result = prewarm_ssh_master(profile, timeout=min(timeout, 10.0))
+        repairs["prewarm"] = _command_payload(prewarm_result)
+    return repairs
+
+
 def _skipped_remote_agent_status(profile: RemoteCodexProfile) -> LaunchAgentStatusResult:
     label = f"com.conpera.codex-remote-ssh.{_safe_label_name(profile.name)}.daemon"
     return LaunchAgentStatusResult(
@@ -540,6 +643,8 @@ def _print_doctor(payload: dict) -> None:
     table.add_row("Local LaunchAgent", "loaded" if payload["local_launch_agent"]["loaded"] else "missing")
     table.add_row("Remote LaunchAgent", "loaded" if payload["remote_launch_agent"]["loaded"] else "missing")
     table.add_row("SSH master", "warm" if payload["prewarm"]["ok"] else "failed")
+    if payload.get("repair"):
+        table.add_row("Repair", ", ".join(payload["repair"].keys()) or "-")
     if payload["issues"]:
         for issue in payload["issues"]:
             table.add_row(f"Issue: {issue['check']}", f"{issue['message']} Fix: {issue['fix']}")
@@ -593,6 +698,29 @@ def _print_optimize(alias: str, ssh_config: Path, daemon_result, remote_agent_re
     console.print(Panel(table, title="Codex App Remote Optimization", title_align="left", border_style="green"))
 
 
+def _print_benchmark(payload: dict) -> None:
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("Benchmark")
+    table.add_column("OK")
+    table.add_column("Samples")
+    table.add_column("Min")
+    table.add_column("P50")
+    table.add_column("P95")
+    table.add_column("Max")
+    for name, item in payload["benchmarks"].items():
+        summary = item["summary"]
+        table.add_row(
+            name,
+            str(item["ok"]),
+            str(len(item["latencies_ms"])),
+            _ms(summary["min"]),
+            _ms(summary["p50"]),
+            _ms(summary["p95"]),
+            _ms(summary["max"]),
+        )
+    console.print(Panel(table, title="Remote Codex Benchmark", title_align="left", border_style="green" if payload["ok"] else "yellow"))
+
+
 def _print_uninstall(payload: dict) -> None:
     table = Table(show_header=False, box=None, pad_edge=False, padding=(0, 3))
     table.add_column(style="bold")
@@ -644,3 +772,7 @@ def _cleanup_payload(result) -> dict:
     payload = _command_payload(result)
     payload["removed_paths"] = result.removed_paths
     return payload
+
+
+def _ms(value: int | None) -> str:
+    return "-" if value is None else f"{value} ms"

@@ -88,6 +88,18 @@ Check the setup:
 codex-remote-ssh doctor studio
 ```
 
+Repair common setup drift:
+
+```bash
+codex-remote-ssh doctor studio --repair --alias codex-studio
+```
+
+Measure warm attach latency:
+
+```bash
+codex-remote-ssh benchmark studio
+```
+
 ## What `optimize-app` Does
 
 `optimize-app` is the normal one-command setup:
@@ -125,6 +137,12 @@ codex-remote-ssh check studio
 
 # Inspect the full product setup and get repair hints
 codex-remote-ssh doctor studio
+
+# Repair common setup drift, then re-run diagnostics
+codex-remote-ssh doctor studio --repair --alias codex-studio
+
+# Measure warm SSH, daemon, and session-index latency
+codex-remote-ssh benchmark studio
 
 # Install or upgrade Codex CLI on the remote host via Homebrew
 codex-remote-ssh install-remote-codex studio
@@ -165,9 +183,10 @@ Tasks:
 5. Run `codex-remote-ssh optimize-app <profile-name> --alias <codex-remote-alias>`.
 6. Run `codex-remote-ssh doctor <profile-name> --json`.
 7. If Codex is missing or outdated on the remote host, run `codex-remote-ssh install-remote-codex <profile-name>`.
-8. Re-run `codex-remote-ssh optimize-app <profile-name> --alias <codex-remote-alias>`.
-9. Measure warm SSH latency with `ssh <codex-remote-alias> true`.
-10. Summarize what was installed, where the LaunchAgents live, current daemon status, and the measured latency.
+8. If `doctor` reports drift, run `codex-remote-ssh doctor <profile-name> --repair --alias <codex-remote-alias>`.
+9. Re-run `codex-remote-ssh optimize-app <profile-name> --alias <codex-remote-alias>` if repair still reports issues.
+10. Measure latency with `codex-remote-ssh benchmark <profile-name> --json`.
+11. Summarize what was installed, where the LaunchAgents live, current daemon status, and the measured latency.
 
 Do not copy API keys or secrets into files. Do not modify unrelated SSH Host entries.
 ```
@@ -222,8 +241,16 @@ Codex App does not show the host:
 SSH is still slow:
 
 - Run: `codex-remote-ssh prewarm studio`
-- Measure warm attach: `time ssh codex-studio true`
+- Measure warm attach: `codex-remote-ssh benchmark studio`
 - Check the local LaunchAgent: `launchctl print gui/$(id -u)/com.conpera.codex-remote-ssh.studio.prewarm`
+
+To measure a cold SSH attach once, run:
+
+```bash
+codex-remote-ssh benchmark studio --include-cold
+```
+
+`--include-cold` closes the current SSH master connection once before measuring. Avoid it during an active Codex App attach if you do not want to disturb that connection.
 
 Remote Codex is missing or too old:
 

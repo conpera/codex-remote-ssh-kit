@@ -4,6 +4,8 @@ import subprocess
 from codex_remote_ssh_kit.bridge import (
     DEFAULT_REMOTE_PORT,
     RemoteCodexProfile,
+    benchmark_command,
+    benchmark_remote_profile,
     bootstrap_remote_daemon,
     build_official_ssh_config_block,
     build_bridge_plan,
@@ -12,6 +14,7 @@ from codex_remote_ssh_kit.bridge import (
     build_ssh_prewarm_command,
     check_local_prewarm_launch_agent,
     check_remote_daemon_launch_agent,
+    close_ssh_master,
     get_profile,
     install_local_prewarm_launch_agent,
     install_remote_daemon_launch_agent,
@@ -157,6 +160,65 @@ def test_run_diagnostics_detects_remote_control_from_top_level_help(monkeypatch)
     facts = run_diagnostics(profile, timeout=3)
 
     assert facts["remote_control"] == "missing"
+
+
+def test_benchmark_command_summarizes_successes(monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = benchmark_command(["ssh", "host", "true"], samples=3, timeout=1)
+
+    assert result["ok"] is True
+    assert len(result["latencies_ms"]) == 3
+    assert result["summary"]["p50"] is not None
+    assert calls == [["ssh", "host", "true"]] * 3
+
+
+def test_close_ssh_master_treats_missing_master_as_ok(monkeypatch):
+    profile = RemoteCodexProfile(name="studio", target="user@host", ssh_alias="codex-studio")
+
+    def fake_run(*args, **kwargs):
+        assert args[0][:4] == ["ssh", "-O", "exit", "codex-studio"]
+        return subprocess.CompletedProcess(args=args[0], returncode=255, stdout="", stderr="No ControlPath")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = close_ssh_master(profile)
+
+    assert result.ok is True
+
+
+def test_benchmark_remote_profile_skips_cold_by_default(monkeypatch):
+    profile = RemoteCodexProfile(name="studio", target="user@host", ssh_alias="codex-studio")
+
+    monkeypatch.setattr(
+        "codex_remote_ssh_kit.bridge.prewarm_ssh_master",
+        lambda profile, *, timeout: subprocess.CompletedProcess(args=["prewarm"], returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        "codex_remote_ssh_kit.bridge._remote_command_to_json",
+        lambda result: {"ok": True, "exit_code": 0, "command": ["prewarm"], "stdout": "", "stderr": ""},
+    )
+    monkeypatch.setattr(
+        "codex_remote_ssh_kit.bridge.benchmark_command",
+        lambda command, *, samples, timeout: {
+            "command": command,
+            "ok": True,
+            "latencies_ms": [1],
+            "failures": [],
+            "summary": {"min": 1, "p50": 1, "p95": 1, "max": 1},
+        },
+    )
+
+    result = benchmark_remote_profile(profile, samples=2)
+
+    assert "cold_ssh_true" not in result["benchmarks"]
+    assert set(result["benchmarks"]) == {"warm_ssh_true", "daemon_version", "session_index"}
 
 
 def test_parse_ssh_target_supports_user_and_plain_host():

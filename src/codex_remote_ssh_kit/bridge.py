@@ -298,6 +298,122 @@ def run_diagnostics(profile: RemoteCodexProfile, *, timeout: float = 10.0) -> di
     return facts
 
 
+def benchmark_remote_profile(
+    profile: RemoteCodexProfile,
+    *,
+    samples: int = 5,
+    timeout: float = 10.0,
+    include_cold: bool = False,
+) -> dict[str, Any]:
+    """Measure common remote attach paths for a Codex SSH host."""
+
+    sample_count = max(samples, 1)
+    payload: dict[str, Any] = {
+        "profile": _profile_to_json(profile),
+        "samples": sample_count,
+        "include_cold": include_cold,
+        "benchmarks": {},
+    }
+    if include_cold:
+        close_result = close_ssh_master(profile, timeout=timeout)
+        payload["close_master"] = _remote_command_to_json(close_result)
+        payload["benchmarks"]["cold_ssh_true"] = benchmark_command(
+            profile.ssh_base_args(prefer_alias=True) + ["true"],
+            samples=1,
+            timeout=timeout,
+        )
+    prewarm_result = prewarm_ssh_master(profile, timeout=timeout)
+    payload["prewarm"] = _remote_command_to_json(prewarm_result)
+    payload["benchmarks"]["warm_ssh_true"] = benchmark_command(
+        profile.ssh_base_args(prefer_alias=True) + ["true"],
+        samples=sample_count,
+        timeout=timeout,
+    )
+    payload["benchmarks"]["daemon_version"] = benchmark_command(
+        profile.ssh_base_args(prefer_alias=True) + ["codex app-server daemon version >/dev/null 2>&1"],
+        samples=sample_count,
+        timeout=timeout,
+    )
+    payload["benchmarks"]["session_index"] = benchmark_command(
+        profile.ssh_base_args(prefer_alias=True)
+        + ["test -f ~/.codex/session_index.jsonl && tail -n 20 ~/.codex/session_index.jsonl >/dev/null 2>&1 || true"],
+        samples=sample_count,
+        timeout=timeout,
+    )
+    payload["ok"] = all(item["ok"] for item in payload["benchmarks"].values())
+    return payload
+
+
+def benchmark_command(command: list[str], *, samples: int, timeout: float) -> dict[str, Any]:
+    """Run a command repeatedly and summarize successful latencies."""
+
+    latencies: list[int] = []
+    failures: list[dict[str, Any]] = []
+    for _ in range(max(samples, 1)):
+        started = time.perf_counter()
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            elapsed_ms = round((time.perf_counter() - started) * 1000)
+            failures.append(
+                {
+                    "exit_code": 124,
+                    "latency_ms": elapsed_ms,
+                    "stderr": f"timed out after {exc.timeout} seconds",
+                }
+            )
+            continue
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        if result.returncode == 0:
+            latencies.append(elapsed_ms)
+        else:
+            failures.append(
+                {
+                    "exit_code": result.returncode,
+                    "latency_ms": elapsed_ms,
+                    "stderr": result.stderr.strip(),
+                }
+            )
+    return {
+        "command": command,
+        "ok": not failures,
+        "latencies_ms": latencies,
+        "failures": failures,
+        "summary": _latency_summary(latencies),
+    }
+
+
+def close_ssh_master(profile: RemoteCodexProfile, *, timeout: float = 10.0) -> RemoteCommandResult:
+    """Close an existing SSH master connection for explicit cold-start tests."""
+
+    command = profile.ssh_base_args(prefer_alias=True)
+    command[1:1] = ["-O", "exit"]
+    result = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+    stderr = result.stderr.strip()
+    missing_master = any(
+        marker in stderr
+        for marker in ("No ControlPath", "No such file", "Control socket connect")
+    )
+    return RemoteCommandResult(
+        command=command,
+        exit_code=0 if result.returncode == 0 or (result.returncode == 255 and missing_master) else result.returncode,
+        stdout=result.stdout.strip(),
+        stderr=stderr,
+    )
+
+
 def bootstrap_remote_daemon(profile: RemoteCodexProfile, *, timeout: float = 30.0) -> RemoteCommandResult:
     """Install and start durable remote Codex daemon support on the host."""
 
@@ -811,6 +927,35 @@ def find_free_port() -> int:
 def _profile_to_json(profile: RemoteCodexProfile) -> dict[str, Any]:
     payload = asdict(profile)
     return {key: value for key, value in payload.items() if value not in (None, [], "")}
+
+
+def _remote_command_to_json(result: RemoteCommandResult) -> dict[str, Any]:
+    return {
+        "ok": result.ok,
+        "exit_code": result.exit_code,
+        "command": result.command,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def _latency_summary(latencies: list[int]) -> dict[str, int | None]:
+    if not latencies:
+        return {"min": None, "p50": None, "p95": None, "max": None}
+    sorted_latencies = sorted(latencies)
+    return {
+        "min": sorted_latencies[0],
+        "p50": _percentile(sorted_latencies, 0.50),
+        "p95": _percentile(sorted_latencies, 0.95),
+        "max": sorted_latencies[-1],
+    }
+
+
+def _percentile(sorted_values: list[int], percentile: float) -> int:
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    index = round((len(sorted_values) - 1) * percentile)
+    return sorted_values[index]
 
 
 def _timeout_result(command: list[str], exc: subprocess.TimeoutExpired) -> RemoteCommandResult:

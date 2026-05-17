@@ -206,6 +206,111 @@ def test_doctor_json_reports_issues(monkeypatch, tmp_path):
     assert '"check": "codex"' in result.output
 
 
+def test_doctor_repair_installs_local_agent_and_rechecks(monkeypatch, tmp_path):
+    state = tmp_path / "hosts.json"
+    ssh_config = tmp_path / "ssh_config"
+    runner.invoke(app, ["add", "studio", "user@host.local", "--state", str(state)])
+
+    class Agent:
+        ok = False
+        exit_code = 3
+        command = ["agent"]
+        stdout = ""
+        stderr = ""
+        label = "agent"
+        plist_path = "/tmp/agent.plist"
+        script_path = "/tmp/agent.sh"
+
+        def __init__(self, loaded):
+            self.loaded = loaded
+
+    class Command:
+        command = ["ssh"]
+        stdout = ""
+        stderr = ""
+        exit_code = 0
+
+        def __init__(self, ok):
+            self.ok = ok
+
+    local_states = iter([Agent(False), Agent(True)])
+    prewarm_states = iter([Command(False), Command(True), Command(True)])
+    repairs: list[str] = []
+
+    monkeypatch.setattr(
+        "codex_remote_ssh_kit.cli.run_diagnostics",
+        lambda profile, *, timeout: {
+            "ok": True,
+            "latency_ms": 9,
+            "codex_path": "/opt/homebrew/bin/codex",
+            "app_server": "ok",
+            "app_server_daemon": "yes",
+            "remote_control": "ok",
+        },
+    )
+    monkeypatch.setattr("codex_remote_ssh_kit.cli.check_local_prewarm_launch_agent", lambda profile: next(local_states))
+    monkeypatch.setattr("codex_remote_ssh_kit.cli.check_remote_daemon_launch_agent", lambda profile, *, timeout: Agent(True))
+    monkeypatch.setattr("codex_remote_ssh_kit.cli.prewarm_ssh_master", lambda profile, *, timeout: next(prewarm_states))
+    monkeypatch.setattr(
+        "codex_remote_ssh_kit.cli.install_local_prewarm_launch_agent",
+        lambda profile, *, interval_seconds: repairs.append("local-agent") or Agent(True),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "doctor",
+            "studio",
+            "--repair",
+            "--alias",
+            "codex-studio",
+            "--ssh-config",
+            str(ssh_config),
+            "--state",
+            str(state),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"ok": true' in result.output
+    assert '"repair"' in result.output
+    assert repairs == ["local-agent"]
+    assert "codex-studio" in ssh_config.read_text()
+
+
+def test_benchmark_json_uses_profile(monkeypatch, tmp_path):
+    state = tmp_path / "hosts.json"
+    runner.invoke(app, ["add", "studio", "user@host.local", "--state", str(state)])
+
+    def fake_benchmark(profile, *, samples, timeout, include_cold):
+        assert profile.name == "studio"
+        assert samples == 2
+        assert include_cold is True
+        return {
+            "ok": True,
+            "samples": samples,
+            "include_cold": include_cold,
+            "benchmarks": {
+                "warm_ssh_true": {
+                    "ok": True,
+                    "latencies_ms": [1, 2],
+                    "summary": {"min": 1, "p50": 1, "p95": 2, "max": 2},
+                    "failures": [],
+                    "command": ["ssh"],
+                }
+            },
+        }
+
+    monkeypatch.setattr("codex_remote_ssh_kit.cli.benchmark_remote_profile", fake_benchmark)
+
+    result = runner.invoke(app, ["benchmark", "studio", "--samples", "2", "--include-cold", "--json", "--state", str(state)])
+
+    assert result.exit_code == 0
+    assert '"include_cold": true' in result.output
+    assert '"warm_ssh_true"' in result.output
+
+
 def test_install_remote_codex_dry_run(tmp_path):
     state = tmp_path / "hosts.json"
     runner.invoke(app, ["add", "studio", "user@host.local", "--state", str(state)])
