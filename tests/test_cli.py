@@ -160,3 +160,97 @@ def test_optimize_app_runs_all_setup(monkeypatch, tmp_path):
     assert "Codex App Remote Optimization" in result.output
     assert "codex-studio" in ssh_config.read_text()
     assert opened == [["open", "codex://settings/connections"]]
+
+
+def test_doctor_json_reports_issues(monkeypatch, tmp_path):
+    state = tmp_path / "hosts.json"
+    runner.invoke(app, ["add", "studio", "user@host.local", "--state", str(state)])
+
+    class FakeAgent:
+        ok = False
+        exit_code = 3
+        command = ["agent"]
+        stdout = ""
+        stderr = "missing"
+        label = "agent"
+        loaded = False
+        plist_path = "/tmp/agent.plist"
+        script_path = "/tmp/agent.sh"
+
+    class FakeCommand:
+        ok = True
+        exit_code = 0
+        command = ["ssh"]
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        "codex_remote_ssh_kit.cli.run_diagnostics",
+        lambda profile, *, timeout: {
+            "ok": True,
+            "latency_ms": 9,
+            "codex_path": "",
+            "app_server": "missing",
+            "app_server_daemon": "no",
+            "remote_control": "missing",
+        },
+    )
+    monkeypatch.setattr("codex_remote_ssh_kit.cli.check_local_prewarm_launch_agent", lambda profile: FakeAgent())
+    monkeypatch.setattr("codex_remote_ssh_kit.cli.check_remote_daemon_launch_agent", lambda profile, *, timeout: FakeAgent())
+    monkeypatch.setattr("codex_remote_ssh_kit.cli.prewarm_ssh_master", lambda profile, *, timeout: FakeCommand())
+
+    result = runner.invoke(app, ["doctor", "studio", "--json", "--state", str(state)])
+
+    assert result.exit_code == 1
+    assert '"ok": false' in result.output
+    assert '"check": "codex"' in result.output
+
+
+def test_install_remote_codex_dry_run(tmp_path):
+    state = tmp_path / "hosts.json"
+    runner.invoke(app, ["add", "studio", "user@host.local", "--state", str(state)])
+
+    result = runner.invoke(app, ["install-remote-codex", "studio", "--dry-run", "--state", str(state)])
+
+    assert result.exit_code == 0
+    assert "brew install --cask codex" in result.output
+
+
+def test_uninstall_removes_profile_and_components(monkeypatch, tmp_path):
+    state = tmp_path / "hosts.json"
+    ssh_config = tmp_path / "ssh_config"
+    runner.invoke(app, ["add", "studio", "user@host.local", "--state", str(state)])
+
+    class FakeCleanup:
+        ok = True
+        exit_code = 0
+        command = ["cleanup"]
+        stdout = ""
+        stderr = ""
+        removed_paths = ["/tmp/file"]
+
+    monkeypatch.setattr(
+        "codex_remote_ssh_kit.cli.uninstall_local_prewarm_launch_agent",
+        lambda profile, *, remove_files: FakeCleanup(),
+    )
+    monkeypatch.setattr(
+        "codex_remote_ssh_kit.cli.uninstall_remote_daemon_launch_agent",
+        lambda profile, *, remove_files, timeout: FakeCleanup(),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "uninstall",
+            "studio",
+            "--ssh-config",
+            str(ssh_config),
+            "--state",
+            str(state),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"profile_removed": true' in result.output
+    assert '"profiles": {}' in state.read_text()

@@ -44,6 +44,12 @@ ssh user@host 'codex --version && codex app-server daemon --help && codex remote
 
 ## Install
 
+One-line install from GitHub:
+
+```bash
+uv tool install git+https://github.com/conpera/codex-remote-ssh-kit.git
+```
+
 From source:
 
 ```bash
@@ -75,6 +81,12 @@ codex-remote-ssh optimize-app studio \
 ```
 
 Then open Codex App and select the `codex-studio` SSH host in Connections / Remote SSH.
+
+Check the setup:
+
+```bash
+codex-remote-ssh doctor studio
+```
 
 ## What `optimize-app` Does
 
@@ -111,8 +123,17 @@ codex-remote-ssh optimize-app studio --alias codex-studio
 # Inspect remote status
 codex-remote-ssh check studio
 
+# Inspect the full product setup and get repair hints
+codex-remote-ssh doctor studio
+
+# Install or upgrade Codex CLI on the remote host via Homebrew
+codex-remote-ssh install-remote-codex studio
+
 # Upgrade remote Codex via Homebrew cask
 codex-remote-ssh upgrade-remote studio
+
+# Remove managed SSH config, LaunchAgents, and the saved profile
+codex-remote-ssh uninstall studio
 ```
 
 ## Agent One-Shot Deploy Prompt
@@ -139,13 +160,14 @@ Remote target:
 Tasks:
 1. Verify local `ssh` can reach the remote host.
 2. Verify remote `codex --version`, `codex app-server daemon --help`, and `codex remote-control --help`.
-3. Install this CLI locally with `uv tool install .` or run it with `uv run`.
+3. Install this CLI locally with `uv tool install git+https://github.com/conpera/codex-remote-ssh-kit.git`, or clone the repo and run it with `uv run`.
 4. Add the profile with `codex-remote-ssh add`.
 5. Run `codex-remote-ssh optimize-app <profile-name> --alias <codex-remote-alias>`.
-6. Run `codex-remote-ssh check <profile-name> --json`.
-7. Verify local LaunchAgent and remote LaunchAgent are installed and have last exit code 0.
-8. Measure warm SSH latency with `ssh <codex-remote-alias> true`.
-9. Summarize what was installed, where the LaunchAgents live, current daemon status, and the measured latency.
+6. Run `codex-remote-ssh doctor <profile-name> --json`.
+7. If Codex is missing or outdated on the remote host, run `codex-remote-ssh install-remote-codex <profile-name>`.
+8. Re-run `codex-remote-ssh optimize-app <profile-name> --alias <codex-remote-alias>`.
+9. Measure warm SSH latency with `ssh <codex-remote-alias> true`.
+10. Summarize what was installed, where the LaunchAgents live, current daemon status, and the measured latency.
 
 Do not copy API keys or secrets into files. Do not modify unrelated SSH Host entries.
 ```
@@ -179,8 +201,48 @@ Remote machine:
 - The App authenticates using your existing SSH setup.
 - This tool does not store OpenAI API keys.
 - The SSH config block is wrapped in managed markers and can be replaced idempotently.
+- Multiple remote hosts are supported inside the same managed SSH config section.
 - Token files used by the fallback app-server bridge are created under `/tmp` with mode `0600`.
 - Public-key-only SSH hardening is only added when an identity file is provided.
+
+## Troubleshooting
+
+Run this first:
+
+```bash
+codex-remote-ssh doctor studio
+```
+
+Codex App does not show the host:
+
+- Confirm the managed host exists: `grep -A20 codex-studio ~/.ssh/config`
+- Re-run: `codex-remote-ssh official-bootstrap studio --alias codex-studio`
+- Restart Codex App after changing SSH config.
+
+SSH is still slow:
+
+- Run: `codex-remote-ssh prewarm studio`
+- Measure warm attach: `time ssh codex-studio true`
+- Check the local LaunchAgent: `launchctl print gui/$(id -u)/com.conpera.codex-remote-ssh.studio.prewarm`
+
+Remote Codex is missing or too old:
+
+```bash
+codex-remote-ssh install-remote-codex studio
+codex-remote-ssh optimize-app studio --alias codex-studio
+```
+
+Remote sessions do not appear:
+
+- Verify the remote host is the one selected in Codex App.
+- Check `codex-remote-ssh doctor studio`.
+- Confirm remote session files exist: `ssh codex-studio 'ls ~/.codex/sessions | tail'`.
+
+Clean rollback:
+
+```bash
+codex-remote-ssh uninstall studio
+```
 
 ## Limitations
 

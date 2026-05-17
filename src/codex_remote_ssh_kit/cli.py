@@ -13,10 +13,15 @@ from rich.table import Table
 
 from codex_remote_ssh_kit.bridge import (
     DEFAULT_REMOTE_PORT,
+    LaunchAgentStatusResult,
     RemoteCodexProfile,
+    RemoteCommandResult,
     bootstrap_remote_daemon,
+    build_remote_install_command,
     build_remote_upgrade_command,
     build_ssh_prewarm_command,
+    check_local_prewarm_launch_agent,
+    check_remote_daemon_launch_agent,
     default_state_path_from_env,
     get_profile,
     install_local_prewarm_launch_agent,
@@ -26,6 +31,9 @@ from codex_remote_ssh_kit.bridge import (
     prewarm_ssh_master,
     run_diagnostics,
     save_profiles,
+    uninstall_local_prewarm_launch_agent,
+    uninstall_official_ssh_config,
+    uninstall_remote_daemon_launch_agent,
     upsert_profile,
 )
 
@@ -108,6 +116,40 @@ def check_profile(
         return
     _print_diagnostics(facts)
     if not facts["ok"]:
+        raise typer.Exit(1)
+
+
+@app.command("doctor")
+def doctor_profile(
+    name: Annotated[str, typer.Argument(help="Profile name.")],
+    timeout: Annotated[float, typer.Option("--timeout", help="SSH timeout in seconds.")] = 10.0,
+    state: Annotated[Path | None, typer.Option("--state", help="Profile store path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
+) -> None:
+    profile = _profile(name, state)
+    facts = run_diagnostics(profile, timeout=timeout)
+    local_agent = check_local_prewarm_launch_agent(profile)
+    if facts.get("ok"):
+        remote_agent = check_remote_daemon_launch_agent(profile, timeout=timeout)
+        prewarm_result = prewarm_ssh_master(profile, timeout=min(timeout, 10.0))
+    else:
+        remote_agent = _skipped_remote_agent_status(profile)
+        prewarm_result = _skipped_command_result(profile)
+    issues = _doctor_issues(facts, local_agent, remote_agent, prewarm_result)
+    payload = {
+        "profile": profile.__dict__,
+        "diagnostics": facts,
+        "local_launch_agent": _launch_agent_status_payload(local_agent),
+        "remote_launch_agent": _launch_agent_status_payload(remote_agent),
+        "prewarm": _command_payload(prewarm_result),
+        "issues": issues,
+        "ok": not issues,
+    }
+    if json_output:
+        console.print_json(json.dumps(payload))
+    else:
+        _print_doctor(payload)
+    if issues:
         raise typer.Exit(1)
 
 
@@ -251,6 +293,73 @@ def upgrade_remote(
         raise typer.Exit(result.returncode)
 
 
+@app.command("install-remote-codex")
+def install_remote_codex(
+    name: Annotated[str, typer.Argument(help="Profile name.")],
+    allow_auto_update: Annotated[bool, typer.Option("--allow-auto-update", help="Allow Homebrew auto-update.")] = False,
+    force_reinstall: Annotated[bool, typer.Option("--force-reinstall", help="Run brew reinstall when Codex already exists.")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Only print the remote install command.")] = False,
+    state: Annotated[Path | None, typer.Option("--state", help="Profile store path.")] = None,
+) -> None:
+    profile = _profile(name, state)
+    command = build_remote_install_command(
+        profile,
+        no_auto_update=not allow_auto_update,
+        force_reinstall=force_reinstall,
+    )
+    rendered = " ".join(shlex.quote(part) for part in command)
+    if dry_run:
+        console.print(rendered)
+        return
+    console.print(Panel(rendered, title="Remote Codex Install", title_align="left", border_style="yellow"))
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise typer.Exit(result.returncode)
+
+
+@app.command("uninstall")
+def uninstall_profile(
+    name: Annotated[str, typer.Argument(help="Profile name.")],
+    alias: Annotated[str | None, typer.Option("--alias", help="SSH Host alias to remove. Defaults to saved alias.")] = None,
+    ssh_config: Annotated[Path, typer.Option("--ssh-config", help="SSH config path to update.")] = Path("~/.ssh/config"),
+    keep_profile: Annotated[bool, typer.Option("--keep-profile", help="Do not remove the saved profile.")] = False,
+    keep_files: Annotated[bool, typer.Option("--keep-files", help="Unload agents but keep scripts and logs.")] = False,
+    timeout: Annotated[float, typer.Option("--timeout", help="SSH timeout in seconds.")] = 20.0,
+    state: Annotated[Path | None, typer.Option("--state", help="Profile store path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
+) -> None:
+    profile = _profile(name, state)
+    ssh_result = uninstall_official_ssh_config(profile, alias=alias, path=ssh_config)
+    local_result = uninstall_local_prewarm_launch_agent(profile, remove_files=not keep_files)
+    remote_result = uninstall_remote_daemon_launch_agent(
+        profile,
+        remove_files=not keep_files,
+        timeout=timeout,
+    )
+    removed_profile = False
+    if not keep_profile:
+        path = _state_path(state)
+        profiles = load_profiles(path)
+        removed_profile = profiles.pop(name, None) is not None
+        save_profiles(profiles, path)
+    payload = {
+        "ssh_config": {
+            "alias": ssh_result.alias,
+            "path": str(ssh_result.path),
+            "changed": ssh_result.changed,
+        },
+        "local_launch_agent": _cleanup_payload(local_result),
+        "remote_launch_agent": _cleanup_payload(remote_result),
+        "profile_removed": removed_profile,
+    }
+    if json_output:
+        console.print_json(json.dumps(payload))
+    else:
+        _print_uninstall(payload)
+    if local_result.exit_code != 0 or remote_result.exit_code != 0:
+        raise typer.Exit(1)
+
+
 def _state_path(path: Path | None) -> Path:
     return path.expanduser() if path else default_state_path_from_env()
 
@@ -273,6 +382,33 @@ def _save_alias(profile: RemoteCodexProfile, alias: str, state: Path | None) -> 
 
 def _error(message: str) -> None:
     console.print(f"[red]Error:[/red] {message}")
+
+
+def _skipped_remote_agent_status(profile: RemoteCodexProfile) -> LaunchAgentStatusResult:
+    label = f"com.conpera.codex-remote-ssh.{_safe_label_name(profile.name)}.daemon"
+    return LaunchAgentStatusResult(
+        command=[],
+        exit_code=1,
+        stdout="",
+        stderr="skipped because SSH diagnostics failed",
+        label=label,
+        loaded=False,
+        plist_path=f"$HOME/Library/LaunchAgents/{label}.plist",
+        script_path=f"$HOME/.codex-remote-ssh-kit/bin/{label}.sh",
+    )
+
+
+def _skipped_command_result(profile: RemoteCodexProfile) -> RemoteCommandResult:
+    return RemoteCommandResult(
+        command=profile.ssh_base_args(prefer_alias=True),
+        exit_code=1,
+        stdout="",
+        stderr="skipped because SSH diagnostics failed",
+    )
+
+
+def _safe_label_name(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in name)
 
 
 def _print_profile_table(profiles: list[RemoteCodexProfile], *, title: str) -> None:
@@ -318,6 +454,96 @@ def _print_diagnostics(facts: dict) -> None:
         if value not in (None, ""):
             table.add_row(key, str(value))
     console.print(Panel(table, title="Remote Codex Diagnostics", title_align="left", border_style="cyan"))
+
+
+def _doctor_issues(facts: dict, local_agent, remote_agent, prewarm_result) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    if not facts.get("ok"):
+        issues.append(
+            {
+                "check": "ssh",
+                "message": facts.get("stderr") or "SSH diagnostics failed.",
+                "fix": "Verify the target, identity file, VPN, and SSH config.",
+            }
+        )
+        return issues
+    if not facts.get("codex_path"):
+        issues.append(
+            {
+                "check": "codex",
+                "message": "Codex CLI was not found on the remote host.",
+                "fix": "Run `codex-remote-ssh install-remote-codex <profile>` or install Codex manually.",
+            }
+        )
+    if facts.get("app_server") != "ok":
+        issues.append(
+            {
+                "check": "app-server",
+                "message": "Remote Codex CLI does not expose app-server.",
+                "fix": "Upgrade remote Codex with `codex-remote-ssh install-remote-codex <profile>`.",
+            }
+        )
+    if facts.get("app_server_daemon") != "yes":
+        issues.append(
+            {
+                "check": "daemon",
+                "message": "Remote Codex app-server daemon is missing.",
+                "fix": "Upgrade remote Codex, then run `codex-remote-ssh optimize-app <profile>`.",
+            }
+        )
+    if facts.get("remote_control") != "ok":
+        issues.append(
+            {
+                "check": "remote-control",
+                "message": "Remote Codex CLI does not expose remote-control.",
+                "fix": "Upgrade remote Codex and confirm the desktop app supports Remote SSH.",
+            }
+        )
+    if not local_agent.loaded:
+        issues.append(
+            {
+                "check": "local-launch-agent",
+                "message": "Local SSH prewarm LaunchAgent is not loaded.",
+                "fix": "Run `codex-remote-ssh optimize-app <profile>`.",
+            }
+        )
+    if not remote_agent.loaded:
+        issues.append(
+            {
+                "check": "remote-launch-agent",
+                "message": "Remote Codex daemon LaunchAgent is not loaded.",
+                "fix": "Run `codex-remote-ssh optimize-app <profile>`.",
+            }
+        )
+    if not prewarm_result.ok:
+        issues.append(
+            {
+                "check": "ssh-master",
+                "message": prewarm_result.stderr or "SSH master prewarm failed.",
+                "fix": "Run `codex-remote-ssh prewarm <profile>` and inspect SSH errors.",
+            }
+        )
+    return issues
+
+
+def _print_doctor(payload: dict) -> None:
+    table = Table(show_header=False, box=None, pad_edge=False, padding=(0, 3))
+    table.add_column(style="bold")
+    table.add_column(overflow="fold")
+    facts = payload["diagnostics"]
+    table.add_row("Overall", "OK" if payload["ok"] else "Needs attention")
+    table.add_row("Latency", f"{facts.get('latency_ms', '?')} ms")
+    table.add_row("Codex", str(facts.get("codex_version") or "missing"))
+    table.add_row("App server", str(facts.get("app_server") or "missing"))
+    table.add_row("Daemon capability", str(facts.get("app_server_daemon") or "missing"))
+    table.add_row("Remote control", str(facts.get("remote_control") or "missing"))
+    table.add_row("Local LaunchAgent", "loaded" if payload["local_launch_agent"]["loaded"] else "missing")
+    table.add_row("Remote LaunchAgent", "loaded" if payload["remote_launch_agent"]["loaded"] else "missing")
+    table.add_row("SSH master", "warm" if payload["prewarm"]["ok"] else "failed")
+    if payload["issues"]:
+        for issue in payload["issues"]:
+            table.add_row(f"Issue: {issue['check']}", f"{issue['message']} Fix: {issue['fix']}")
+    console.print(Panel(table, title="Remote Codex Doctor", title_align="left", border_style="green" if payload["ok"] else "yellow"))
 
 
 def _print_bootstrap(alias: str, path: Path, changed: bool, facts: dict) -> None:
@@ -367,6 +593,18 @@ def _print_optimize(alias: str, ssh_config: Path, daemon_result, remote_agent_re
     console.print(Panel(table, title="Codex App Remote Optimization", title_align="left", border_style="green"))
 
 
+def _print_uninstall(payload: dict) -> None:
+    table = Table(show_header=False, box=None, pad_edge=False, padding=(0, 3))
+    table.add_column(style="bold")
+    table.add_column(overflow="fold")
+    table.add_row("SSH config changed", str(payload["ssh_config"]["changed"]))
+    table.add_row("SSH alias", payload["ssh_config"]["alias"])
+    table.add_row("Local removed", ", ".join(payload["local_launch_agent"]["removed_paths"]) or "-")
+    table.add_row("Remote removed", ", ".join(payload["remote_launch_agent"]["removed_paths"]) or "-")
+    table.add_row("Profile removed", str(payload["profile_removed"]))
+    console.print(Panel(table, title="Remote Codex Uninstall", title_align="left", border_style="yellow"))
+
+
 def _command_payload(result) -> dict:
     return {
         "ok": result.ok,
@@ -386,4 +624,23 @@ def _launch_agent_payload(result) -> dict:
             "script_path": result.script_path,
         }
     )
+    return payload
+
+
+def _launch_agent_status_payload(result) -> dict:
+    payload = _command_payload(result)
+    payload.update(
+        {
+            "label": result.label,
+            "loaded": result.loaded,
+            "plist_path": result.plist_path,
+            "script_path": result.script_path,
+        }
+    )
+    return payload
+
+
+def _cleanup_payload(result) -> dict:
+    payload = _command_payload(result)
+    payload["removed_paths"] = result.removed_paths
     return payload

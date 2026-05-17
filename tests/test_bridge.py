@@ -7,8 +7,11 @@ from codex_remote_ssh_kit.bridge import (
     bootstrap_remote_daemon,
     build_official_ssh_config_block,
     build_bridge_plan,
+    build_remote_install_command,
     build_remote_upgrade_command,
     build_ssh_prewarm_command,
+    check_local_prewarm_launch_agent,
+    check_remote_daemon_launch_agent,
     get_profile,
     install_local_prewarm_launch_agent,
     install_remote_daemon_launch_agent,
@@ -18,6 +21,9 @@ from codex_remote_ssh_kit.bridge import (
     prewarm_ssh_master,
     run_diagnostics,
     save_profiles,
+    uninstall_local_prewarm_launch_agent,
+    uninstall_official_ssh_config,
+    uninstall_remote_daemon_launch_agent,
     upsert_profile,
 )
 
@@ -325,6 +331,45 @@ def test_install_official_ssh_config_is_managed_and_idempotent(tmp_path):
     assert text.count("Host codex-studio") == 1
 
 
+def test_install_official_ssh_config_preserves_multiple_managed_hosts(tmp_path):
+    path = tmp_path / "config"
+    first = RemoteCodexProfile(name="studio", target="user@host.local")
+    second = RemoteCodexProfile(name="lab", target="ops@lab.local")
+
+    install_official_ssh_config(first, alias="codex-studio", path=path)
+    install_official_ssh_config(second, alias="codex-lab", path=path)
+
+    text = path.read_text()
+    assert text.count("Host codex-studio") == 1
+    assert text.count("Host codex-lab") == 1
+    assert text.count("# >>> codex-remote-ssh official hosts >>>") == 1
+
+
+def test_uninstall_official_ssh_config_removes_only_one_managed_host(tmp_path):
+    path = tmp_path / "config"
+    first = RemoteCodexProfile(name="studio", target="user@host.local", ssh_alias="codex-studio")
+    second = RemoteCodexProfile(name="lab", target="ops@lab.local")
+    install_official_ssh_config(first, alias="codex-studio", path=path)
+    install_official_ssh_config(second, alias="codex-lab", path=path)
+
+    result = uninstall_official_ssh_config(first, path=path)
+
+    text = path.read_text()
+    assert result.changed is True
+    assert "Host codex-studio" not in text
+    assert "Host codex-lab" in text
+
+
+def test_uninstall_official_ssh_config_removes_empty_section(tmp_path):
+    path = tmp_path / "config"
+    profile = RemoteCodexProfile(name="studio", target="user@host.local")
+    install_official_ssh_config(profile, alias="codex-studio", path=path)
+
+    uninstall_official_ssh_config(profile, alias="codex-studio", path=path)
+
+    assert "codex-remote-ssh official hosts" not in path.read_text()
+
+
 def test_build_remote_upgrade_command_defaults_to_no_auto_update():
     profile = RemoteCodexProfile(name="studio", target="user@host.local")
 
@@ -333,3 +378,84 @@ def test_build_remote_upgrade_command_defaults_to_no_auto_update():
     assert command[:2] == ["ssh", "user@host.local"]
     assert "HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade --cask codex" in command[-1]
     assert "remote-control" in command[-1]
+
+
+def test_build_remote_install_command_installs_when_codex_missing():
+    profile = RemoteCodexProfile(name="studio", target="user@host.local")
+
+    command = build_remote_install_command(profile)
+
+    assert "brew install --cask codex" in command[-1]
+    assert "brew upgrade --cask codex" in command[-1]
+
+
+def test_check_local_prewarm_launch_agent_reports_loaded(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="state = running\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = check_local_prewarm_launch_agent(RemoteCodexProfile(name="studio", target="user@host"))
+
+    assert result.loaded is True
+    assert result.label == "com.conpera.codex-remote-ssh.studio.prewarm"
+
+
+def test_check_remote_daemon_launch_agent_reports_missing(monkeypatch):
+    profile = RemoteCodexProfile(name="studio", target="user@host", ssh_alias="codex-studio")
+
+    def fake_run(*args, **kwargs):
+        assert args[0][:2] == ["ssh", "codex-studio"]
+        return subprocess.CompletedProcess(args=args[0], returncode=3, stdout="", stderr="missing")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = check_remote_daemon_launch_agent(profile)
+
+    assert result.loaded is False
+    assert result.exit_code == 3
+
+
+def test_uninstall_local_prewarm_launch_agent_removes_files(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    profile = RemoteCodexProfile(name="studio", target="user@host")
+    label = "com.conpera.codex-remote-ssh.studio.prewarm"
+    plist = tmp_path / f"Library/LaunchAgents/{label}.plist"
+    script = tmp_path / f".codex-remote-ssh-kit/bin/{label}.sh"
+    plist.parent.mkdir(parents=True)
+    script.parent.mkdir(parents=True)
+    plist.write_text("plist")
+    script.write_text("script")
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr=""),
+    )
+
+    result = uninstall_local_prewarm_launch_agent(profile)
+
+    assert str(plist) in result.removed_paths
+    assert str(script) in result.removed_paths
+    assert not plist.exists()
+    assert not script.exists()
+
+
+def test_uninstall_remote_daemon_launch_agent_removes_remote_files(monkeypatch):
+    profile = RemoteCodexProfile(name="studio", target="user@host", ssh_alias="codex-studio")
+
+    def fake_run(*args, **kwargs):
+        command = args[0]
+        assert command[:2] == ["ssh", "codex-studio"]
+        assert "launchctl bootout" in command[-1]
+        assert "rm -f" in command[-1]
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = uninstall_remote_daemon_launch_agent(profile)
+
+    assert result.exit_code == 0
+    assert "$HOME/Library/LaunchAgents/com.conpera.codex-remote-ssh.studio.daemon.plist" in result.removed_paths

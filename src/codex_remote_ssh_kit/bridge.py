@@ -103,6 +103,23 @@ class LaunchAgentInstallResult(RemoteCommandResult):
     script_path: str
 
 
+@dataclass(frozen=True)
+class LaunchAgentStatusResult(RemoteCommandResult):
+    """Status for a launchd LaunchAgent."""
+
+    label: str
+    loaded: bool
+    plist_path: str
+    script_path: str
+
+
+@dataclass(frozen=True)
+class CleanupResult(RemoteCommandResult):
+    """Result from cleaning up local or remote managed files."""
+
+    removed_paths: list[str]
+
+
 def load_profiles(path: Path = DEFAULT_STATE_PATH) -> dict[str, RemoteCodexProfile]:
     if not path.exists():
         return {}
@@ -366,6 +383,76 @@ def prewarm_ssh_master(profile: RemoteCodexProfile, *, timeout: float = 10.0) ->
     )
 
 
+def check_local_prewarm_launch_agent(profile: RemoteCodexProfile) -> LaunchAgentStatusResult:
+    """Return launchd status for the local SSH prewarm LaunchAgent."""
+
+    label = f"com.conpera.codex-remote-ssh.{_safe_name(profile.name)}.prewarm"
+    root = Path("~/.codex-remote-ssh-kit").expanduser()
+    plist_path = Path("~/Library/LaunchAgents").expanduser() / f"{label}.plist"
+    script_path = root / "bin" / f"{label}.sh"
+    command = ["launchctl", "print", f"gui/{os.getuid()}/{label}"]
+    result = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    return LaunchAgentStatusResult(
+        command=command,
+        exit_code=result.returncode,
+        stdout=result.stdout.strip(),
+        stderr=result.stderr.strip(),
+        label=label,
+        loaded=result.returncode == 0,
+        plist_path=str(plist_path),
+        script_path=str(script_path),
+    )
+
+
+def check_remote_daemon_launch_agent(profile: RemoteCodexProfile, *, timeout: float = 10.0) -> LaunchAgentStatusResult:
+    """Return launchd status for the remote Codex daemon LaunchAgent."""
+
+    label = f"com.conpera.codex-remote-ssh.{_safe_name(profile.name)}.daemon"
+    plist_path = f"$HOME/Library/LaunchAgents/{label}.plist"
+    script_path = f"$HOME/.codex-remote-ssh-kit/bin/{label}.sh"
+    remote_command = (
+        "set +e; "
+        f"launchctl print gui/$(id -u)/{label}; "
+        "exit $?"
+    )
+    ssh_command = profile.ssh_base_args(prefer_alias=True) + [remote_command]
+    try:
+        result = subprocess.run(
+            ssh_command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_result = _timeout_result(ssh_command, exc)
+        return LaunchAgentStatusResult(
+            command=timeout_result.command,
+            exit_code=timeout_result.exit_code,
+            stdout=timeout_result.stdout,
+            stderr=timeout_result.stderr,
+            label=label,
+            loaded=False,
+            plist_path=plist_path,
+            script_path=script_path,
+        )
+    return LaunchAgentStatusResult(
+        command=ssh_command,
+        exit_code=result.returncode,
+        stdout=result.stdout.strip(),
+        stderr=result.stderr.strip(),
+        label=label,
+        loaded=result.returncode == 0,
+        plist_path=plist_path,
+        script_path=script_path,
+    )
+
+
 def install_local_prewarm_launch_agent(
     profile: RemoteCodexProfile,
     *,
@@ -421,6 +508,39 @@ def install_local_prewarm_launch_agent(
         label=label,
         plist_path=str(plist_path),
         script_path=str(script_path),
+    )
+
+
+def uninstall_local_prewarm_launch_agent(profile: RemoteCodexProfile, *, remove_files: bool = True) -> CleanupResult:
+    """Unload and optionally remove the local SSH prewarm LaunchAgent."""
+
+    label = f"com.conpera.codex-remote-ssh.{_safe_name(profile.name)}.prewarm"
+    root = Path("~/.codex-remote-ssh-kit").expanduser()
+    plist_path = Path("~/Library/LaunchAgents").expanduser() / f"{label}.plist"
+    script_path = root / "bin" / f"{label}.sh"
+    log_paths = [
+        root / "logs" / f"{label}.out.log",
+        root / "logs" / f"{label}.err.log",
+    ]
+    command = ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)]
+    result = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    removed_paths: list[str] = []
+    if remove_files:
+        for path in [plist_path, script_path, *log_paths]:
+            if path.exists():
+                path.unlink()
+                removed_paths.append(str(path))
+    return CleanupResult(
+        command=command,
+        exit_code=0 if result.returncode in (0, 5) else result.returncode,
+        stdout=result.stdout.strip(),
+        stderr=result.stderr.strip(),
+        removed_paths=removed_paths,
     )
 
 
@@ -486,21 +606,89 @@ def install_remote_daemon_launch_agent(
     )
 
 
-def build_remote_upgrade_command(profile: RemoteCodexProfile, *, no_auto_update: bool = True) -> list[str]:
-    """Return the SSH command that upgrades Codex on the remote host via Homebrew."""
+def uninstall_remote_daemon_launch_agent(
+    profile: RemoteCodexProfile,
+    *,
+    remove_files: bool = True,
+    timeout: float = 20.0,
+) -> CleanupResult:
+    """Unload and optionally remove the remote Codex daemon LaunchAgent."""
+
+    label = f"com.conpera.codex-remote-ssh.{_safe_name(profile.name)}.daemon"
+    files = [
+        f"$HOME/Library/LaunchAgents/{label}.plist",
+        f"$HOME/.codex-remote-ssh-kit/bin/{label}.sh",
+        f"$HOME/.codex-remote-ssh-kit/logs/{label}.out.log",
+        f"$HOME/.codex-remote-ssh-kit/logs/{label}.err.log",
+    ]
+    remove_command = ""
+    if remove_files:
+        quoted_files = " ".join(files)
+        remove_command = f"rm -f {quoted_files}; "
+    remote_command = (
+        "set +e; "
+        f"launchctl bootout gui/$(id -u) $HOME/Library/LaunchAgents/{label}.plist >/dev/null 2>&1; "
+        f"{remove_command}"
+        "exit 0"
+    )
+    ssh_command = profile.ssh_base_args(prefer_alias=True) + [remote_command]
+    try:
+        result = subprocess.run(
+            ssh_command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_result = _timeout_result(ssh_command, exc)
+        return CleanupResult(
+            command=timeout_result.command,
+            exit_code=timeout_result.exit_code,
+            stdout=timeout_result.stdout,
+            stderr=timeout_result.stderr,
+            removed_paths=[],
+        )
+    return CleanupResult(
+        command=ssh_command,
+        exit_code=result.returncode,
+        stdout=result.stdout.strip(),
+        stderr=result.stderr.strip(),
+        removed_paths=files if remove_files else [],
+    )
+
+
+def build_remote_install_command(
+    profile: RemoteCodexProfile,
+    *,
+    no_auto_update: bool = True,
+    force_reinstall: bool = False,
+) -> list[str]:
+    """Return the SSH command that installs or upgrades Codex on the remote host."""
 
     prefix = "HOMEBREW_NO_AUTO_UPDATE=1 " if no_auto_update else ""
+    brew_action = "reinstall" if force_reinstall else "upgrade"
     command = (
         "set -e; "
         "if ! command -v brew >/dev/null 2>&1; then "
         "echo 'Homebrew not found on remote host' >&2; exit 127; "
         "fi; "
-        f"{prefix}brew upgrade --cask codex; "
+        "if ! command -v codex >/dev/null 2>&1; then "
+        f"{prefix}brew install --cask codex; "
+        "else "
+        f"{prefix}brew {brew_action} --cask codex; "
+        "fi; "
         "codex --version; "
         "codex --help | grep -E '^  (remote-control|app-server)\\b' || true; "
         "codex app-server --help | grep -E '^  (daemon|proxy)\\b|--ws-auth' || true"
     )
     return profile.ssh_base_args() + [command]
+
+
+def build_remote_upgrade_command(profile: RemoteCodexProfile, *, no_auto_update: bool = True) -> list[str]:
+    """Return the SSH command that upgrades Codex on the remote host via Homebrew."""
+
+    return build_remote_install_command(profile, no_auto_update=no_auto_update)
 
 
 def install_official_ssh_config(
@@ -520,7 +708,7 @@ def install_official_ssh_config(
     block = build_official_ssh_config_block(profile, alias=resolved_alias)
     path = path.expanduser()
     existing = path.read_text() if path.exists() else ""
-    updated = _replace_managed_block(existing, block)
+    updated = _upsert_managed_host_block(existing, resolved_alias, block)
     changed = updated != existing
     if changed:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -530,6 +718,29 @@ def install_official_ssh_config(
         path=path,
         changed=changed,
         block=block,
+    )
+
+
+def uninstall_official_ssh_config(
+    profile: RemoteCodexProfile,
+    *,
+    alias: str | None = None,
+    path: Path = DEFAULT_SSH_CONFIG_PATH,
+) -> OfficialSshConfigResult:
+    """Remove one managed SSH Host block from the Codex Remote SSH section."""
+
+    resolved_alias = alias or profile.ssh_alias or _safe_ssh_alias(profile.name)
+    path = path.expanduser()
+    existing = path.read_text() if path.exists() else ""
+    updated = _remove_managed_host_block(existing, resolved_alias)
+    changed = updated != existing
+    if changed:
+        path.write_text(updated)
+    return OfficialSshConfigResult(
+        alias=resolved_alias,
+        path=path,
+        changed=changed,
+        block="",
     )
 
 
@@ -624,14 +835,90 @@ def _safe_ssh_alias(name: str) -> str:
     return alias or "remote-codex"
 
 
-def _replace_managed_block(existing: str, block: str) -> str:
+def _upsert_managed_host_block(existing: str, alias: str, block: str) -> str:
+    entries = _managed_host_blocks(existing)
+    entries[alias] = _strip_managed_markers(block)
+    return _replace_managed_section(existing, entries)
+
+
+def _remove_managed_host_block(existing: str, alias: str) -> str:
+    entries = _managed_host_blocks(existing)
+    entries.pop(alias, None)
+    return _replace_managed_section(existing, entries)
+
+
+def _managed_host_blocks(existing: str) -> dict[str, str]:
+    section = _managed_section(existing)
+    entries: dict[str, str] = {}
+    current_alias: str | None = None
+    current_lines: list[str] = []
+    for line in section.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("#"):
+            continue
+        if line.startswith("Host "):
+            if current_alias and current_lines:
+                entries[current_alias] = "\n".join(current_lines) + "\n"
+            current_alias = line.split(None, 1)[1].strip()
+            current_lines = [line]
+            continue
+        if current_alias:
+            current_lines.append(line)
+    if current_alias and current_lines:
+        entries[current_alias] = "\n".join(current_lines) + "\n"
+    return entries
+
+
+def _managed_section(existing: str) -> str:
+    if OFFICIAL_SSH_BEGIN not in existing or OFFICIAL_SSH_END not in existing:
+        return ""
+    _, rest = existing.split(OFFICIAL_SSH_BEGIN, 1)
+    section, _ = rest.split(OFFICIAL_SSH_END, 1)
+    return section
+
+
+def _replace_managed_section(existing: str, entries: dict[str, str]) -> str:
+    section = _render_managed_section(entries)
     if OFFICIAL_SSH_BEGIN in existing and OFFICIAL_SSH_END in existing:
         before, rest = existing.split(OFFICIAL_SSH_BEGIN, 1)
         _, after = rest.split(OFFICIAL_SSH_END, 1)
+        before = before.rstrip()
         after = after.lstrip("\n")
-        suffix = f"\n{after}" if after else ""
-        return before.rstrip() + "\n\n" + block.rstrip() + "\n" + suffix
-    return existing.rstrip() + "\n\n" + block if existing else block
+        if section:
+            prefix = before + "\n\n" if before else ""
+            suffix = "\n" + after if after else ""
+            return prefix + section + suffix
+        return (before + ("\n" + after if before and after else after)).rstrip() + ("\n" if before or after else "")
+    if not section:
+        return existing
+    return existing.rstrip() + "\n\n" + section if existing else section
+
+
+def _render_managed_section(entries: dict[str, str]) -> str:
+    if not entries:
+        return ""
+    lines = [
+        OFFICIAL_SSH_BEGIN,
+        "# Managed by `codex-remote-ssh official-bootstrap`.",
+        "# Codex App reads these hosts from ~/.ssh/config for Remote SSH.",
+    ]
+    for alias in sorted(entries):
+        lines.append("")
+        lines.append(entries[alias].strip())
+    lines.append(OFFICIAL_SSH_END)
+    return "\n".join(lines) + "\n"
+
+
+def _strip_managed_markers(block: str) -> str:
+    lines = [
+        line
+        for line in block.splitlines()
+        if line not in (OFFICIAL_SSH_BEGIN, OFFICIAL_SSH_END)
+        and not line.startswith("# Managed by ")
+        and not line.startswith("# Codex App reads ")
+    ]
+    return "\n".join(line for line in lines if line.strip()) + "\n"
 
 
 def _ssh_config_options_from_args(args: list[str]) -> list[str]:
