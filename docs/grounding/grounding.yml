@@ -1,0 +1,42 @@
+# grounding.yml — machine-readable index + drift-checker config.
+# Lives at <repo-root>/docs/grounding/grounding.yml. The checker reads ONLY this
+# file's documents[] list (it never globs the folder), so EVERY grounding doc
+# the skill emits MUST be registered here. README.md is exempt and MUST NOT appear.
+#
+# Parses under the closed YAML subset the checker supports:
+#   - top-level "key: value" scalars
+#   - one-level block sequences ("  - item")
+#   - inline flow sequences "[a, b, c]"
+#   - block-mapping items in a sequence: first key on the "- " line (2 spaces),
+#     continuation keys aligned at 4 spaces.
+# Rules: spaces only (no tabs), 2-space indent per level, quote any value that
+# contains a colon, "#", leading/trailing space, or starts with [ { or a quote.
+
+version: 1                                    # schema version (fixed: 1)
+grounding_dir: docs/grounding                 # repo-root-relative; documents[].file resolves under this
+staleness_days: 90                            # last_verified older than this -> WARN (ERROR if strict)
+strict: false                                 # if true, all warnings become errors (CI gate)
+
+# Kinds that MUST exist (matched by kind, not filename). The default trio.
+required_documents: [code-map, invariants, verification]
+
+# One entry per grounding doc. "kind" MUST equal the doc's own grounding_kind
+# front-matter (checker errors on mismatch). Legal kinds (closed set, verbatim):
+#   code-map | domain-glossary | domain-rules | flow | invariants | verification | adr
+documents:
+  - file: code-map.md                         # Layer 1: structure
+    kind: code-map
+  - file: domain/glossary.md                  # Layer 2: ubiquitous language
+    kind: domain-glossary
+  - file: domain/rules.md                      # Layer 2: business rules
+    kind: domain-rules
+  - file: domain/flows/optimize-app.md         # Layer 2: one use-case flow (kebab-case id)
+    kind: flow
+  - file: invariants.md                        # Layer 3: do-not-break / do-not-touch
+    kind: invariants
+  - file: verification.md                      # Layer 4: how to verify a change
+    kind: verification
+  - file: decisions/0001-pure-bridge-thin-cli.md      # Layer 5: ADR-0001
+    kind: adr
+  - file: decisions/0002-managed-ssh-config-block.md  # Layer 5: ADR-0002
+    kind: adr

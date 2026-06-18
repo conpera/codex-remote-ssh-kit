@@ -1,0 +1,5 @@
+# STATE (tier-0): current working memory. Overwritten each session, engine-excluded.
+task: ""
+branch: ""
+open_threads: []
+updated: ""
